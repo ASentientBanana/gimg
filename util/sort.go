@@ -7,10 +7,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/rwcarlsen/goexif/exif"
 )
@@ -33,13 +33,15 @@ type ExifData struct {
 }
 
 type ScanCounterElement struct {
-	// dir file
 	Type string
 }
 
 type DirScanResults struct {
-	Path string
-	Data ExifData
+	Path            string
+	Data            ExifData
+	Name            string
+	BackupPath      string
+	ExifUnavailable bool
 }
 
 var FILE_SET_WHITELIST = make(map[string]struct{})
@@ -98,48 +100,6 @@ func GetDirContents(cp ContentParams) GetDirResult {
 	return contents
 }
 
-func CheckForMonthFolders(contents []string) (bool, error) {
-
-	_d := map[string]bool{
-		"1":  false,
-		"2":  false,
-		"3":  false,
-		"4":  false,
-		"5":  false,
-		"6":  false,
-		"7":  false,
-		"8":  false,
-		"9":  false,
-		"10": false,
-		"11": false,
-		"12": false,
-	}
-
-	for _, f := range contents {
-
-		val, ok := _d[f]
-
-		if !ok {
-			continue
-		}
-		if val == true {
-			return false, errors.New("conflicting dir names")
-		}
-
-		_d[f] = true
-
-	}
-	count := 0
-	for i := range 12 {
-		val, ok := _d[strconv.Itoa(i)]
-		if ok && val {
-			count++
-		}
-	}
-	// Test
-	return count == 12, nil
-}
-
 func CreateMonthDirectories(_path string) {
 	for i := range 12 {
 		name := i + 1
@@ -155,7 +115,27 @@ func CreateMonthDirectories(_path string) {
 	}
 }
 
-func ScanDirRecursiveForImageFiles(path string, wg *sync.WaitGroup, result chan<- DirScanResults, counter chan<- ScanCounterElement) {
+func ExtractCreationData(filepath string) error {
+	// if no exif data available, use file created date.
+
+	if runtime.GOOS == "windows" {
+		// Todo(petar): maybe ignore windows
+		_, err := os.Stat(filepath)
+		if err != nil {
+			return err
+		}
+		//Todo(petar): Continue the windows handler
+		// d := fi.Sys().(*syscall.)
+		// if !ok {
+		// 	return time.Time{}, fmt.Errorf("not a Windows file attribute")
+		// }
+	} else {
+
+	}
+	return nil
+}
+
+func ScanDirRecursiveForImageFiles(path string, wg *sync.WaitGroup, baseDir string, result chan<- DirScanResults, counter chan<- ScanCounterElement) {
 	defer wg.Done()
 	contents := GetDirContents(ContentParams{
 		Filter:  "",
@@ -166,19 +146,22 @@ func ScanDirRecursiveForImageFiles(path string, wg *sync.WaitGroup, result chan<
 	for _, d := range contents.Dirs {
 		counter <- ScanCounterElement{Type: "dir"}
 		wg.Add(1)
-		go ScanDirRecursiveForImageFiles(d, wg, result, counter)
+		newBaseDir := filepath.Join(baseDir, filepath.Base(d))
+		go ScanDirRecursiveForImageFiles(d, wg, newBaseDir, result, counter)
 	}
 	for _, f := range contents.Files {
-		// log.Printf("Working on %s", f)
+
 		fData, err := ExtractExifDate(f)
-		// fmt.Printf("File: %s", f)
-		if err != nil {
-			fmt.Println("Miss")
-			fmt.Println(err.Error())
+		if err != nil || fData.DataString == " " || fData.DataString == "" {
+			fName := filepath.Base(f)
+
+			counter <- ScanCounterElement{Type: "file"}
+			result <- DirScanResults{Path: f, Data: fData, ExifUnavailable: true, Name: fName, BackupPath: baseDir}
 			continue
 		}
+
 		counter <- ScanCounterElement{Type: "file"}
-		result <- DirScanResults{Path: f, Data: fData}
+		result <- DirScanResults{Path: f, Data: fData, ExifUnavailable: false, Name: "", BackupPath: ""}
 	}
 }
 
@@ -205,16 +188,8 @@ func ExtractExifDate(f string) (ExifData, error) {
 	defer i.Close()
 	ex, err := exif.Decode(i)
 	if err != nil {
-		info, err2 := i.Stat()
-		if err2 != nil {
-			fmt.Println(err2.Error())
-			return data, err
-		}
-		modTime := info.ModTime()
-		data.Year = strconv.Itoa(modTime.Year())
-		data.Month = strconv.Itoa(int(modTime.Month()))
-		data.DataString = strings.Replace(modTime.Format(formatString), " ", "_", 1)
-		return data, nil
+		//Todo(peata): handle no exif data case
+		return data, errors.New("NO EXIF DATA AVAILABLE.")
 	}
 
 	t, err := ex.DateTime()
@@ -233,19 +208,33 @@ type DirMap map[string]map[string][]DirScanResults
 
 func CreateDirMapFromIndexedData(sr *[]DirScanResults) (DirMap, error) {
 	dirMap := make(DirMap)
-
 	for _, v := range *sr {
-		_, ok := dirMap[v.Data.Year]
-		if !ok {
-			// Populate months
-			for i := range 12 {
-				dirMap[v.Data.Year] = make(map[string][]DirScanResults)
-				dirMap[v.Data.Year][strconv.Itoa(i+1)] = []DirScanResults{}
+		// Checking for files with unavailable exif data to separate them.
+		if v.ExifUnavailable {
+			_, ok := dirMap["unknown"]
+			if !ok {
+				fmt.Println("Creating unlnown dir map entry")
+				dirMap["unknown"] = make(map[string][]DirScanResults)
+				dirMap["unknown"]["unknown"] = []DirScanResults{}
 			}
+			dirMap["unknown"]["unknown"] = append(dirMap["unknown"]["unknown"], v)
+			continue
 		}
 
-		dirMap[v.Data.Year][v.Data.Month] = append(dirMap[v.Data.Year][v.Data.Month], v)
+		_, ok := dirMap[v.Data.Year]
+		if !ok {
+			dirMap[v.Data.Year] = make(map[string][]DirScanResults)
+		}
 
+		_, ok = dirMap[v.Data.Year][v.Data.Month]
+
+		if ok {
+			dirMap[v.Data.Year][v.Data.Month] = append(dirMap[v.Data.Year][v.Data.Month], v)
+
+		} else {
+			dirMap[v.Data.Year][v.Data.Month] = []DirScanResults{}
+			dirMap[v.Data.Year][v.Data.Month] = append(dirMap[v.Data.Year][v.Data.Month], v)
+		}
 	}
 	return dirMap, nil
 }
@@ -259,24 +248,32 @@ func DumpToFile(data string, p string) error {
 	return err
 }
 
-func CreateFileStructure(dirPath string, years []string) error {
-	fmt.Println(dirPath)
-	for _, year := range years {
+func CreateFileStructure(dirPath string, dirMap *DirMap) error {
+
+	for year := range *dirMap {
 		yearPath := path.Join(dirPath, year)
 		e, err := os.Stat(yearPath)
 		if err == nil && e.IsDir() {
 			continue
 		}
+
 		err = os.Mkdir(yearPath, 0755)
+
 		if err != nil {
 			return err
 		}
-		for i := range 12 {
-			err := os.Mkdir(path.Join(yearPath, strconv.Itoa(i+1)), 0755)
-			if err != nil {
-				return err
+
+		if year == "unknown" {
+			for _, unknownFile := range (*dirMap)[year][year] {
+				os.MkdirAll(filepath.Join(yearPath, unknownFile.BackupPath), 0755)
 			}
+			continue
 		}
+		//Create month directories
+		for m := range (*dirMap)[year] {
+			os.Mkdir(path.Join(yearPath, m), 0755)
+		}
+
 	}
 	return nil
 }
@@ -298,38 +295,47 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func CopyFilesFromMap(_map DirMap, destination string, progressChan chan<- int) (int, error) {
+func CopyFilesFromMap(_map *DirMap, destination string) (int, error) {
 	wg := &sync.WaitGroup{}
 	files := make(chan bool, 10)
 
-	// Create date dirs
-	years := []string{}
-
-	for y := range _map {
-		years = append(years, y)
-	}
-
-	if err := CreateFileStructure(destination, years); err != nil {
+	// Create date directories
+	if err := CreateFileStructure(destination, _map); err != nil {
 		return 0, err
 	}
 
-	for y := range _map {
-		year, ok := _map[y]
+	for y := range *_map {
+
+		year, ok := (*_map)[y]
+
 		if !ok {
 			continue
 		}
+
+		if y == "unknown" {
+			wg.Add(1)
+			go func(_wg *sync.WaitGroup, fChan chan<- bool) {
+
+				for _, elem := range (*_map)[y] {
+
+					for _, e := range elem {
+						dst := path.Join(destination, "unknown", e.BackupPath, e.Name)
+						_ = copyFile(e.Path, dst)
+						fChan <- true
+					}
+				}
+				_wg.Done()
+			}(wg, files)
+			continue
+		}
+
 		for _, month := range year {
 			wg.Add(1)
 			go func(_wg *sync.WaitGroup, fChan chan<- bool) {
 				for _, d := range month {
-					// Do smtn
 					dst := path.Join(destination, d.Data.Year, d.Data.Month, d.Data.DataString+path.Ext(d.Path))
-					// fmt.Println(dst)
 					err := copyFile(d.Path, dst)
-					time.Sleep(3000 * time.Microsecond)
 
-					progressChan <- 1
-					fmt.Println("Send prog")
 					if err != nil {
 						fChan <- false
 					} else {

@@ -4,5 +4,5 @@ go.sum
 gimg.exe
 gimg
 
-
+.vscode/
 .idea/

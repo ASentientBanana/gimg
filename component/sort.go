@@ -51,7 +51,7 @@ func handleDirScan(data *SortData, dirPathIndex int) {
 
 	wg.Add(1)
 	go func() {
-		util.ScanDirRecursiveForImageFiles(data.dirPath[dirPathIndex], wg, results, entityCount)
+		util.ScanDirRecursiveForImageFiles(data.dirPath[dirPathIndex], wg, "", results, entityCount)
 	}()
 
 	go func() {
@@ -103,9 +103,14 @@ func NewSortView(w *fyne.Window) *SortView {
 		numberOfFiles:   0,
 	}
 
+	data.destinationPath = "/home/petar/Desktop/dump/"
+	data.dirPath = []string{
+		"/home/petar/Pictures",
+	}
+
 	p := &SortView{
 		FoundFilesLabel: widget.NewLabel("No files scanned..."),
-		// StatusLabel:         widget.NewLabel(""),
+
 		DestinationDirLabel: widget.NewLabel("No destination directory selected"),
 		Status:              0,
 		ProgressCount:       binding.NewInt(),
@@ -164,46 +169,32 @@ func NewSortView(w *fyne.Window) *SortView {
 			return
 		}
 
-		progressChan := make(chan int, 100)
-
 		dMap, err := util.CreateDirMapFromIndexedData(&data.images)
+
+		fmt.Println("Map has %n elements", len(dMap))
+
+		for k := range dMap {
+			fmt.Println(k)
+		}
 
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
 
-		years := []string{}
-
-		for y := range dMap {
-			years = append(years, y)
-		}
-
-		err = util.CreateFileStructure(data.destinationPath, years)
+		err = util.CreateFileStructure(data.destinationPath, &dMap)
 
 		if err != nil {
 			return
 		}
 
-		go func() {
-			prog := 0
-			for range progressChan {
-				fmt.Println("Rec prog")
-				prog++
+		fNum, err := util.CopyFilesFromMap(&dMap, data.destinationPath)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 
-				i, err := p.ProgressCount.Get()
-				if err == nil {
-					p.ProgressCount.Set(i + 1)
-				}
-
-			}
-		}()
-
-		go func() {
-			util.CopyFilesFromMap(dMap, data.destinationPath, progressChan)
-			close(progressChan)
-		}()
-
+		p.StatusLabel.SetText(fmt.Sprintf("Transfered %d image files.", fNum))
 	})
 
 	p.RunButton.Importance = widget.SuccessImportance
@@ -226,7 +217,6 @@ func NewSortView(w *fyne.Window) *SortView {
 	})
 
 	p.ListView.Resize(fyne.NewSize(900, p.ListView.MinSize().Height))
-
 	p.Content = container.NewCenter(container.NewHBox(container.NewVBox(container.NewHBox(p.FindDirButton, p.ScanButton), p.FoundFilesLabel, p.SelectDestinationButton, p.DestinationDirLabel, p.RunButton, p.StatusLabel), container.New(layout.NewGridWrapLayout(fyne.NewSize(300, 400)), p.ListView)))
 	return p
 }
